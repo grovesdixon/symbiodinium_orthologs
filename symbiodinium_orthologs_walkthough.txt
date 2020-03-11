@@ -1,0 +1,428 @@
+#symbiodinium_orthologs_walkthrough.txt
+
+
+########################################
+############## AQUIRE DATA #############
+########################################
+
+#because the symbiont genomes are still a little messy,
+#will work with transcriptomes for clades A,B,C and D:
+#clade C = Cladocopium
+#clade D = Durusdinium
+
+
+#download A and B from here: http://zoox.reefgenomics.org/download/
+wget http://smic.reefgenomics.org/download/Smic.transcriptomeRef.cov5.fa.gz
+wget http://zoox.reefgenomics.org/download/Symbiodinium_minutum.tar.gz
+
+#download C and D from here: https://palumbilab.stanford.edu/data/
+wget https://palumbilab.stanford.edu/data/Symbiod_CladeC_and_D_contigs_annots.tar.gz
+wget https://palumbilab.stanford.edu/data/50763_c_and_d_sym_totalannotated.txt.zip
+
+
+
+#################################
+########### PREP DATA ###########
+#################################
+
+#copy over from raw locations
+cp /work/02260/grovesd/lonestar/symbiont_orthos/raw/*.fa .
+
+>nameReplacement
+for file in *.fa
+do echo "replace_deflines.py -fa $file -prefix ${file/_raw.fa/} -o ${file/_raw.fa/}.fasta -clean yes" >> nameReplacement
+done
+
+
+#RE-ISOGROPUING
+#it is not clear how (if at all) transcripts from each transcriptome were grouped into isogroups
+#to make sure this is standardized across them, redo it here
+#This will be done following the Matz lab annotation pipeline
+#from https://github.com/z0on/annotatingTranscriptomes/blob/master/annotating%20trascriptome.txt:
+		# if you have no assembler-derived isogroups, use cd-hit-est to cluster contigs.
+		# to look for 98% or better matches between contigs taking 30% of length of either longer or shorter sequence:
+		cd-hit-est -i transcriptome.fasta -o transcriptome_clust.fasta -c 0.99 -G 0 -aL 0.3 -aS 0.3
+		# adding cluster designations to fasta headers, creating seq2iso table:
+		isogroup_namer.pl transcriptome.fasta transcriptome_clust.fasta.clstr 
+
+
+#run cd-hit for all transcriptomes
+module load cd-hit
+>clust
+for file in *.fasta
+do echo "cd-hit-est -i $file -o ${file/.fasta/_clust.fa} -c 0.98 -G 0 -aL 0.3 -aS 0.3" >> clust
+done
+
+
+#now output only the longest contig from each cluster
+>getLongest
+for file in *.fasta
+do echo "longest_isotig.py -i $file -cdh ${file/.fasta/}_clust.fa.clstr -o ${file/.fasta/_longest.fa} > ${file/.fasta/}_getLongest.log" >> getLongest
+done
+
+
+####################################
+####### GETTING PROTEIN SEQS #######
+####################################
+
+#grab the longest isotigs
+cp /work/02260/grovesd/lonestar/symbiont_orthos/longest/*.fa .
+
+
+## STEP1: GET LONGEST OPEN READING FRAMES
+#basic command:
+#TransDecoder.LongOrfs -t infile.fasta -m 50
+
+#setup
+>tdec1
+for file in *.fa; do echo "$TRANSDEC/TransDecoder.LongOrfs -t $file -m 50" >> tdec1
+done
+
+launcher_creator.py -n tdec1 -j tdec1 -q normal -N 1 -w 24 -a $allo -e $email -t 1:00:00
+
+
+## STEP 2: BLAST TO SWISSPROT
+#uniprot_sprot database can be found here: wget ftp://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz
+#basic command:
+#blastp -query longest_orfs.pep -db /path_to_swiss_prot_db/swissprot -max_target_seqs 1 -outfmt 6 -evalue 1e-5 -num_threads 20 > file_blastp.out 
+
+module load blast
+>spBlast
+for file in *longest.fa
+do echo "blastp -query ${file}.transdecoder_dir/longest_orfs.pep \
+-db /scratch/02260/grovesd/uniprot/uniprot_sprot.fasta \
+-max_target_seqs 1 \
+-outfmt 6 \
+-evalue 1e-5 \
+-num_threads 36 \
+> ${file/.fasta/}_blastSP.out" >> spBlast
+done
+
+launcher_creator.py -n spBlast -j spBlast -q normal -N 2 -w 1 -a $allo -e $email -t 12:00:00
+sbatch spBlast.slurm 
+
+
+## STEP 3: HMM SCANS (can be run simultaneously with blast)
+#get the database from here: https://github.com/TransDecoder/TransDecoder/wiki:
+
+#basic command:
+#hmmscan --cpu 1 --domtblout ./test.domtblout /scratch/02260/grovesd/pfam_db/Pfam-A.hmm longest_orfs.pep
+
+
+#then run hmmscan
+PFAM_DATABASE=/scratch/02260/grovesd/pfam_db/Pfam-A.hmm
+>scanHmm
+for file in *.fa
+do echo "hmmscan --cpu 36 \
+--domtblout ./${file/_longest.fa/}.domtblout ${PFAM_DATABASE} ${file}.transdecoder_dir/longest_orfs.pep > ${file/.fasta/}_hmmscan.log" >> scanHmm
+done
+
+launcher_creator.py -n scanHmm -j scanHmm -q normal -N 2 -w 1 -a $allo -e $email -t 24:00:00
+sbatch scanHmm.slurm 
+
+
+
+## STEP 4: PREDICT PROTEINS FROM LONGEST ORFS AND BLAST/HMMSCAN
+#basic command:
+TransDecoder.Predict -t infile.fasta --retain_pfam_hits file.domtblout --retain_blastp_hits file_blastp.out --single_best_only
+
+
+#setup
+>tdec2
+for file in *longest.fa; do echo "$TRANSDEC/TransDecoder.Predict -t ${file} --retain_pfam_hits ${file/_longest.fa/}.domtblout --retain_blastp_hits ${file}_blastSP.out --single_best_only" >> tdec2
+done
+
+
+launcher_creator.py -n tdec2 -j tdec2 -q normal -N 1 -w 4 -a $allo -e $email -t 2:00:00
+
+#final results are .cds and .pep files
+#append .fas to these and save them here:
+/work/02260/grovesd/lonestar/symbiont_orthos/transdecoders_coding_fas/peptide/nucleotide
+/work/02260/grovesd/lonestar/symbiont_orthos/transdecoders_coding_fas/peptide
+	
+	
+
+#####################################
+######### CALLING ORTHOLOGS #########
+#####################################
+
+#FIRST ASSEMBLE THE PROTEIN SEQUENCES
+ln -s /work/02260/grovesd/lonestar/symbiont_orthos/transdecoders_coding_fas/peptide/*.fas .
+ls *pep.fas | wc -l
+	#2
+
+#the blasting takes a long time, so need to do it in pieces for paralellization
+#first use FastOrtho to build a compiled file for blasting:
+module load blast                                               #load module for blast
+export BLASTP=$(which blastp)                                   #path to blastp
+export MAKEBLASTDB=$(which makeblastdb)                         #path to makeblastdb
+export MCL="$WORK/mcl/bin/mcl"                                  #path to MCL executable
+export FASTORTHO="$WORK/FastOrtho/src/FastOrtho"                #path to FastOrtho executable
+export FAAS="."  #path to where your .faa files are stored (don't include final /)
+export EVALUE="1e-10"                                           #the evalue cutoff you want to use
+export NAME="run1"                                              #name for this FastOrtho run
+export OPTIONS="option_file.txt"                                #desired name for options file
+
+build_options.sh $NAME $OPTIONS
+
+#run FastOrtho
+echo "$FASTORTHO --option_file $OPTIONS" > runFastOrtho
+
+launcher_creator.py -n runFastOrtho -j runFastOrtho -q normal -t 30:00:00 -a $allo -e $email
+sbatch runFastOrtho.slurm
+
+#ran in 2 hours and 40 minutes
+
+
+#FILTER THE COMPILED BLAST RESULTS BASED ON LENGTH
+
+#first get the lengths of each sequence from the blast input files
+for file in *.pep.fas
+do echo "fasta_sequence_characters.py -fa $file > ${file/_longest.fa.transdecoder.pep.fas/}_lengths.tsv &"
+done
+cat clade*lengths.tsv > all_lengths.txt
+
+
+################################################
+#####!! REDUCE TO ONLY CLADE C AND CLADE D #####
+################################################
+
+
+#note, the --pmatch_cutoff argument in FastOrtho seems like it should do this, but didn't work for me
+filter_blast_for_orthos.py -i run1.out -l all_lengths.txt -c 0.75 -o run1.filtered.out
+
+			Results:
+			423487 total lines processed
+			237352 hit lenghts were less than 75.0% of the subject lengths and were removed
+			186135 hits were retained
+			All hits accounted for.
+
+
+#RE-RURN FAST ORTHO ON FILTERED  BLAST RESULTS
+
+#set up the variables needed to build an options file
+module load blast                                               #load module for blast
+export BLASTP=$(which blastp)                                   #path to blastp
+export MAKEBLASTDB=$(which makeblastdb)                         #path to makeblastdb
+export MCL="$WORK/mcl/bin/mcl"                                  #path to MCL executable
+export FASTORTHO="$WORK/FastOrtho/src/FastOrtho"                #path to FastOrtho executable
+export FAAS="."                                        #path to where your .faa files are stored (don't include final /)
+export EVALUE="1e-10"                                           #the evalue cutoff you want to use
+export NAME="run2"                                              #name for this FastOrtho run
+export OPTIONS="option_file.txt"                                #desired name for options file
+
+
+#build options file
+build_options.sh $NAME $OPTIONS
+
+#add the tag for an already available blast results file
+echo "--blast_file $(pwd)/run1.filtered.out" >> option_file.txt
+
+#run FastOrtho
+echo "$FASTORTHO --option_file $OPTIONS" > runFastOrtho
+
+#get long format
+longify_fastOrtho_output.py -i run2.end -o run2_long.tsv
+
+		Parsing fastOrtho file run2.end...
+		Total orthologous groups = 3823
+		Total sequences = 8530
+		Results saved to run2_long.tsv
+
+
+
+#####################################
+########## FILTER PARALOGS ##########
+#####################################
+
+#FIRST OUTPUT THE PROTEIN SEQUENCES
+mkdir filter_paralogs
+cd filter_paralogs
+ln -s ../calling_orthologs/run2.end .
+ln -s /work/02260/grovesd/lonestar/symbiont_orthos/transdecoders_coding_fas/peptide/*.fas .
+output_seqs_step1.py -orthos run2.end -prot *pep.fas -cut 2
+
+		total orthogroups found in 3823
+		857 groups had total taxa below 2 and were skipped
+		2966 total protein groups written to Orthologs_3_9/protein_sequences
+			 
+#outputs the sequences into a directory labeled by the data
+
+
+# ALIGN THEM AND BUILD GENE TREES
+cd Orthologs_DATE_/protein_sequences/
+>doAln
+for file in *.fasta
+do echo "mafft --maxiterate 1000 --localpair $file > ${file/.fasta/}.aln && FastTree ${file/.fasta/}.aln > ${file/.fasta/}.newick" >> doAln
+done
+
+launcher_creator.py -n doAln -j doAln -q normal -N 2 -w 24 -a $allo -e $email -t 2:00:00
+sbatch doAln.slurm
+
+
+#THEN PRUNE TREES TO GET SINGLE-COPY ORTHOLOGS (now requires pandas)
+paraPrune.py -trees *.newick -l all_lengths.txt -subsets True > paraprune.log
+
+#output is singleCopyOrthos.txt
+#results summary:
+			Running paraPrune.py...
+
+			Will save subsets of trees at each step.
+
+			Reading in trees...
+				0 tree files were empty, suggest checking these:
+				20561 total trees for analysis
+
+			Gathering single copy trees...
+				20561 total trees checked for paralogs
+				18569 trees were single copy
+				1992 got paralogs
+				Writing out 18569 initally single copy trees to subdirectory A_init_single_copy_trees...
+				Writing out 1992 initally with paralogs trees to subdirectory A_init_paralog_trees...
+
+			Looking for single-species clades...
+				2507 single-species clades were collapsed into single sequence
+
+			Gathering additional single copy trees after collapsing single-species nodes...
+				1992 total trees checked for paralogs
+				847 trees were single copy
+				1145 got paralogs
+				19416 total single copy orthogroups
+				Writing out 847 single-copy post pruning trees to subdirectory B_post_prune_single_copy_trees...
+				Writing out 1145 with paralogs post pruning trees to subdirectory B_post_prune_paralog_trees...
+
+			Pruning away anemone species and Adig references...
+				0 leafs from unimportant group pruned away
+				94 repeated species within resulting polytomies were pruned
+
+			Gathering additional single copy trees after pruning anemones and Adig reference...
+				1145 total trees checked for paralogs
+				94 trees were single copy
+				1051 got paralogs
+				19510 total single copy orthogroups
+				Writing out 94 single-copy post pruning unimportant trees to subdirectory C_post_prune_single_copy_trees...
+				Writing out 1051 with paralogs post pruning trees to subdirectory C_post_prune_paralog_trees...
+
+			Pruning away ANY repeated species branches in trees with median number of appearances == 1...
+
+			Gathering additional single copy trees after pruning ANY remainging duplicates if they are rare...
+				1051 total trees checked for paralogs
+				476 trees were single copy
+				575 got paralogs
+				19986 total single copy orthogroups
+				Writing out 476 single-copy post pruning ANY trees to subdirectory D_post_prune_single_copy_trees...
+				Writing out 575 with paralogs post pruning ANY trees to subdirectory D_post_prune_paralog_trees...
+
+			Pulling out any perfect subtrees from remaining trees with paralogs
+				Checking through 575 trees with paralogs
+				465 trees had at least one perfect subtree that was made into its own ortholog
+				616 total perfect nodes were found
+				4 total trees were separated completely into perfect subtrees
+				616 total perfect subtrees found among 465 full trees
+				188 trees still had at least 3 terminal branches left after pulling perfect subtrees
+				-------------
+				final check for single copy trees
+				188 total trees checked for paralogs
+				0 trees were single copy
+				188 got paralogs
+				20602 total single copy orthogroups
+				Writing out 0 single-copy post pull perfect trees to subdirectory E_post_perfect_node_single_copy_trees...
+				Writing out 188 with paralogs post pruning ANY trees to subdirectory F_paralog_trees...
+
+			Single copy orthos saved as singleCopyOrthos.txt...
+
+			Done.
+
+
+
+#------- IN CASE YOU WANT TO PULL JUST INITIAL SINGLE COPY ORTHOLOGS
+cd A_init_single_copy_trees
+ls *_paraPruned.newick | sed 's/_paraPruned.newick//' > init_single_copy_orthoGroups.txt
+
+#send resulsts files to /ortholog_results in repository:
+	singleCopyOrthos.txt
+	init_single_copy_orthoGroups.txt
+	collapsed_contigs.tsv
+
+
+
+########################################
+########## BUILD SPECIES TREE ##########
+########################################
+
+#GET EXTRA-HIGH QUALITY ORTHLOGS FOR BUILDING SPECIES TREE
+
+#paraPrune.py outputs a files called singleCopyOrthos.txt, which includes the
+#single copy orthologs after the pruning procedure.
+
+mkdir species_tree
+cd species_tree
+ln -s /work/02260/grovesd/lonestar/symbiont_orthos/transdecoders_coding_fas/peptide/*.fas .
+ln -s /work/02260/grovesd/lonestar/symbiont_orthos/transdecoders_coding_fas/nucleotide/*.fas .
+ln -s ../filter_paralogs/Orthologs_3_5/protein_sequences/singleCopyOrthos.txt .
+
+
+output_seqs_step2.py -orthos singleCopyOrthos.txt -prot *.pep.fas -nuc *.cds.fas -rcut 4 -odir treeOrthos
+
+#Results summary:
+		Writing out sequences to treeOrthos/protein_sequences...
+		20602 total orthologs considered
+		19684 failed representation cutoff of >=4 terminal taxa
+		918 were written
+		All orthologs accounted for.
+
+		Writing out sequences to treeOrthos/cds_sequences...
+		20602 total orthologs considered
+		19684 failed representation cutoff of >=4 terminal taxa
+		918 were written
+		All orthologs accounted for.
+
+
+#ALIGN AND REVERSE TRANSLATE
+>doAln
+for file in *.fasta
+do echo "mafft --maxiterate 1000 --localpair $file > ${file/.fasta/}.aln && \
+pal2nal.pl ${file/.fasta/}.aln ../cds_sequences/${file} -output paml -nogap > ${file/.fasta/}.codon" >> doAln
+done
+
+
+
+#GET SPECIES LIST FROM CDS FILES
+ls *cds.fas | awk '{split($1, a, "_"); print a[1]}' > speciesList.txt
+
+#CONCATENATE THE CODON SEQUENCES INTO A NEXUS FILE
+concatenate_genes_into_nexus.py -spp speciesList.txt -f *.codon -o seqs.nex
+
+#CONVERT THE NEXUS FILE INTO A PHYLIP FILE
+nex2phy.py -i seqs.nex
+
+#---- RUN RAXML ----#
+#set up variables
+S="seqs.phy"              #the sequence file
+Q="seqs_partitions.txt"   #the sequence partition file (separates the concatenated seqs into genes)
+R="bootStrap"                    #the run name (this must be different for each run)
+N="100"                   #iterations for bootstrapping (10K may be too many if you have a lot of genes, but is nice for 100 - 200 genes)
+
+#make command
+echo "/work/02260/grovesd/lonestar/raxml/standard-RAxML-master/raxmlHPC-PTHREADS-SSE3 -s $S -n $R -m GTRCAT -V -f d -T 24 -q $Q -p 12345" > rapidHillClimb
+echo "/work/02260/grovesd/lonestar/raxml/standard-RAxML-master/raxmlHPC-PTHREADS-SSE3 -s $S -n $R -m GTRGAMMA -f a -p 12345 -x 12345 -N $N -T 24 -q $Q" > rapidTreeBoot
+
+#launch
+launcher_creator.py -n rapidTreeBoot -j rapidTreeBoot -q normal -t 24:00:00 -a $allo -e $email -N 1 -w 1
+sbatch rapidTreeBoot.slurm
+
+
+#send the results to 
+
+
+
+
+
+
+
+
+
+
+
+
+

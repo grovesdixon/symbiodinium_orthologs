@@ -1,0 +1,1 @@
+/work/02260/grovesd/lonestar/raxml/standard-RAxML-master/raxmlHPC-PTHREADS-SSE3 -s seqs.phy -n bootStrap -m GTRCAT -f d -T 24 -q seqs_partitions.txt -p 12345

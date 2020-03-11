@@ -1,0 +1,404 @@
+#symbiodinium_RNAseq_walkthough.txt
+
+#####################################
+########## REFERENCE GENOME #########
+#####################################
+
+mkdir /work/02260/grovesd/lonestar/Amil_Zach_Fullers_v2.00_symABCD_transcriptomes
+ln -s ../Amil_Zach_Fullers_v2.00/Amil.v2.00.chrs.fasta .
+ln -s ../symbiont_orthos/longest/*.fa
+cat Amil.v2.00.chrs.fasta cladeA_longest.fa cladeB_longest.fa cladeC_longest.fa cladeD_longest.fa > Amil_ABCD_transcriptomes.fasta
+
+
+
+#####################################
+########### ORGANIZE DATA ###########
+#####################################
+
+#SELECT BIOPROJECTS BASED ON Acropora_gene_expression_meta
+
+
+
+#DOWNLOAD FROM RUNLIST AND DUMP
+
+>download
+while read srr
+do echo "$PREFETCH $srr --max-size 1000G" >> download
+done <runList.txt
+
+
+#dump the fastq files where you want
+#first navigate to the directory you want the placed
+>dump
+while read srr
+do echo "$FQDUMP --split-files ${PREFETCH_PATH}/sra/${srr}.sra &">>dump
+done <runList.txt
+
+
+#also pulled the BEWW files from corral
+cp /corral-repl/utexas/tagmap/dixon_backups/bleach_every_which_way/catted_fastqs .
+
+#after organizing these were the counts:
+ls single/*_1.fastq | wc -l 
+	#298
+ls paired/*_1.fastq | wc -l
+	#31
+	
+	
+	
+######################################
+############## TRIMMING ##############
+######################################
+
+#FOR PAIRED END READS
+
+>trimpe
+for file in *_2.fastq
+do echo "cutadapt \
+-a GATCGGAAGAGCA \
+-A GATCGGAAGAGCA \
+-a AGATCGGAAGAGC \
+-A AGATCGGAAGAGC \
+--minimum-length 20 \
+-q 20 \
+-o ${file/_2.fastq/}_1.trim \
+-p ${file/_2.fastq/}_2.trim \
+${file/_2.fastq/}_1.fastq \
+$file > ${file/_2.fastq/}_trimlog.txt" >> trimpe
+done
+
+
+launcher_creator.py -n trimpe -j trimpe -a $allo -e $email -q normal -t 8:00:00 -N 1 -w 31
+sbatch trimpe.slurm
+
+
+#or
+
+
+#FOR SINGLE END READS
+
+>trimse
+for file in *_1.fastq
+do echo "cutadapt \
+-a GATCGGAAGAGCA \
+-a AGATCGGAAGAGC \
+--minimum-length 20 \
+-q 20 \
+-o ${file/_1.fastq/}_1.trim \
+$file > ${file/_1.fastq}_trimlog.txt" >> trimse
+done
+
+launcher_creator.py -n trimse -j trimse -q normal -N 4 -w 48 -a $allo -e $email -t 08:00:00
+
+
+
+#################################
+############ MAPPING ############
+#################################
+#Here I've noticed threading bowtie by around 4 - 8 works well so we'll go in middle with -p 6
+
+
+#---- FOR PAIRED END READS ----#
+
+module load bowtie
+export REFERENCE_GENOME=/work/02260/grovesd/lonestar/Amil_Zach_Fullers_v2.00_symABCD_transcriptomes/Amil_ABCD_transcriptomes.fasta
+
+
+
+#make a file with names of the paired-end .trim files
+ls *_1.trim | awk '{split($0, a, "_");print a[1]}'> paired_runIDs.txt
+
+>mappe
+while read runID
+do echo "\
+bowtie2 -x $REFERENCE_GENOME -1 ${runID}_1.trim -2 ${runID}_2.trim --local -p 8 -S ${runID}.sam" >> mappe
+done < paired_runIDs.txt
+
+launcher_creator.py -n mappe -j mappe -q normal -N 5 -w 6 -a $allo -t 12:00:00
+
+#with -p 6 for bowtie, wayness of 6 seems good (36 total out of 48, leaving some extra memory), assuming 12 pairs of .trim files to map, 2 nodes lets them all map at once
+#This sometimes finishes as fast as a couple hours, but can take much longer for large .trim files, could be fancy to set the amount of time requested based on the read counts
+
+
+#---- FOR SINGLE END READS ----#
+
+#build mapping commands
+module load bowtie
+>mapse
+for file in *_1.trim
+do echo "\
+bowtie2 -x $REFERENCE_GENOME -U ${file} --local -p 4 -S ${file/_1.trim/}.sam">> mapse
+done
+
+#note wayness more than 6 is no good for this
+launcher_creator.py -n mapse -j mapse -q normal -N 5 -w 8 -a $allo -e $email -t 20:00:00
+
+#with -p 6 for bowtie, wayness of 6 seems good (36 total out of 48, leaving some extra memory), assuming 12 single-end .trim files to map, 2 nodes lets them all map at once. 
+#Again this will probably be faster than 14 hours, but you want to be sure not to get slurmped. Single-end map faster than paired-end
+
+
+
+
+
+###########################################
+##### PREPARE ALIGNMENTS FOR COUNTING #####
+###########################################
+
+#SORT BY COORDIANTE, REMOVE DUPLICATES, THEN CONVERT BACK TO SAM FOR COUNTING
+
+###!!! NOTE! REMOVING PCR DUPLICATES MAY DO MORE HARM THAN GOOD:
+#(https://dnatech.genomecenter.ucdavis.edu/faqs/should-i-remove-pcr-duplicates-from-my-rna-seq-data/)
+#https://www.biostars.org/p/55648/   and these excellent papers
+#Parekh et al 2016:  The impact of amplification on differential expression analyses by RNA-seq.  and
+#Fu et al. 2018:  Elimination of PCR duplicates in RNA-seq and small RNA-seq using unique molecular identifiers.
+# I'M STILL GOING TO DO IT, BUT MAYBE DON'T?
+# INSTEAD, JUST SORT THEM AND GO STRAIGHT TO FEATURECOUNTS
+
+
+#These are fast, but removing duplicates takes a lot of memory
+
+module load samtools
+>removeDups
+for file in *.sam
+do runID=${file/.sam/}
+ echo "samtools sort -O bam -o ${runID}_sorted.bam $file &&\
+ java -Xms4g -jar /work/02260/grovesd/lonestar/picard/picard.jar MarkDuplicates\
+ INPUT=${runID}_sorted.bam\
+ OUTPUT=${runID}_dupsRemoved.bam\
+ METRICS_FILE=${runID}_dupMetrics.txt\
+ REMOVE_DUPLICATES=true &&\
+ samtools index ${runID}_dupsRemoved.bam" >> removeDups
+ done
+ 
+launcher_creator.py -n removeDups -j removeDups -t 24:00:00 -q normal -a $allo -e $email -N 10 -w 2
+##run only two per node, assuming 12 sam files, using six nodes allows for all to run simultaneously, expect run to last ~2-4 hours
+
+
+##################################################
+############## GET ZOOX PROPORTIONS ##############
+##################################################
+
+#first check the sequence definitions in the reference genome
+export REFERENCE_GENOME=/work/02260/grovesd/lonestar/Amil_Zach_Fullers_v2.00_symABCD_transcriptomes/Amil_ABCD_transcriptomes.fasta
+grep ">" $REFERENCE_GENOME | grep clade | awk '{split($1, a, "_"); print a[1]}' | sort | uniq
+
+
+#quality filter the bam files then count up the reads for each symbiont based on the clade string in the sequence definitions
+
+MINQ=40
+>countSymb
+for file in *_dupsRemoved.bam
+do echo "samtools view -F 256 -q $MINQ $file | singleFileZooxType_cladeABCDtranscriptomes.awk > ${file/_dupsRemoved.bam/}_symbCounts.tsv" >>countSymb
+done
+
+launcher_creator.py -n countSymb -j countSymb -q development -N 1 -w 48 -a $allo -t 02:00:00
+
+
+
+#assemble the results
+echo -e "file\tall\tnonSym\tcladeC\tcladeD" > all_zoox_type_counts.tsv
+for file in *_symbCounts.tsv
+do counts=$(cat $file)
+echo -e "${file}\t${counts}" >> all_zoox_type_counts.tsv
+done
+
+#save all_zoox_type_counts.tsv in metadata/
+
+
+###################################################
+############## SPLIT BAMS BY SPECIES ##############
+###################################################
+
+
+
+
+#FIRST GET BED FILES FOR THE TWO TRANSCRIPTOMES
+export REFERENCE_GENOME=/work/02260/grovesd/lonestar/Amil_Zach_Fullers_v2.00_symABCD_transcriptomes/Amil_ABCD_transcriptomes.fasta
+
+bed_from_fasta.py -fa $REFERENCE_GENOME > Amil_cladeABCDtran.bed
+grep -v "^clade" Amil_cladeABCDtran.bed > Amil.bed
+grep "^cladeA_" Amil_cladeABCDtran.bed > cladeA.bed
+grep "^cladeB_" Amil_cladeABCDtran.bed > cladeB.bed
+grep "^cladeC_" Amil_cladeABCDtran.bed > cladeC.bed
+grep "^cladeD_" Amil_cladeABCDtran.bed > cladeD.bed
+
+#THEN SPLIT OUT THE SYMBIONT READS
+module load samtools
+MINQ=40
+>splitOutSymbs
+for file in *_dupsRemoved.bam 
+do echo "\
+samtools view -F 256 -q $MINQ -h -L Amil.bed $file | samtools sort > ${file/_dupsRemoved.bam/}_Amil.bam && samtools index ${file/_dupsRemoved.bam/}_Amil.bam
+samtools view -F 256 -q $MINQ -h -L cladeA.bed $file | samtools sort > ${file/_dupsRemoved.bam/}_cladeA.bam && samtools index ${file/_dupsRemoved.bam/}_cladeA.bam
+samtools view -F 256 -q $MINQ -h -L cladeB.bed $file | samtools sort > ${file/_dupsRemoved.bam/}_cladeB.bam && samtools index ${file/_dupsRemoved.bam/}_cladeB.bam
+samtools view -F 256 -q $MINQ -h -L cladeC.bed $file | samtools sort > ${file/_dupsRemoved.bam/}_cladeC.bam && samtools index ${file/_dupsRemoved.bam/}_cladeC.bam
+samtools view -F 256 -q $MINQ -h -L cladeD.bed $file | samtools sort > ${file/_dupsRemoved.bam/}_cladeD.bam && samtools index ${file/_dupsRemoved.bam/}_cladeD.bam" >>splitOutSymbs
+done
+
+launcher_creator.py -n splitOutSymbs -j splitOutSymbs -q development -N 2 -w 24 -a $allo -e $email -t 02:00:00
+
+#CHECK THEY ALL RAN
+ls *_Amil.bam | wc -l
+ls *_cladeA.bam | wc -l
+ls *_cladeB.bam | wc -l
+ls *_cladeC.bam | wc -l
+ls *_cladeD.bam | wc -l
+	#should all give 329
+
+
+##################################################
+############ GET COUNTS WITH BEDTOOLS ############
+##################################################
+
+echo "cladeA
+cladeB
+cladeC
+cladeD
+Amil" > clades.txt
+
+#split the bed files for paralellization
+rm *_split_*.bed
+while read CLADE
+do echo "split --number=l/4 --additional-suffix=".bed" ${CLADE}.bed ${CLADE}_split_"
+done < clades.txt
+
+
+#single run
+>getCounts
+while read CLADE
+do for SPLIT_BED in ${CLADE}_split_*.bed
+ do echo "bedtools multicov -bams *${CLADE}.bam -bed ${SPLIT_BED} > ${SPLIT_BED/.bed/.counts0}" >> getCounts
+ done
+done < clades.txt
+
+module load bedtools
+launcher_creator.py -n getCounts -j getCounts -q development -N 2 -w 2 -a $allo -e $email -t 02:00:00
+
+
+#ASSEMBLE THE RESULTS
+#build headers
+while read CLADE
+do echo "${CLADE}..."
+samples=$(ls *_${CLADE}.bam | tr "\n" "\t" | sed "s|\t*$||")
+echo -e "chr\tstart\tend\t${samples}" > ${CLADE}_counts.tsv
+done < clades.txt
+
+#append the results for each
+cat Amil_split_a*counts0 >> Amil_counts.tsv
+cat cladeA_split_*.counts0 >> cladeA_counts.tsv
+cat cladeB_split_*.counts0 >> cladeB_counts.tsv
+cat cladeC_split_*.counts0 >> cladeC_counts.tsv
+cat cladeD_split_*.counts0 >> cladeD_counts.tsv
+
+
+#######################################
+####### PIPELINE COUNTS RESULTS #######
+#######################################
+
+
+wc -l *.fastq |\
+ awk '{split($2, a, ".fastq")
+ print a[1]"\t"$1/4"\trawCounts"}' |\
+ grep -v total > raw_read_counts.tsv &
+
+
+#GET POST TRIMMING READ COUNT
+wc -l *.trim |\
+ awk '{split($2, a, ".trim")
+ print a[1]"\t"$1/4"\ttrimmedCounts"}' |\
+ grep -v total > trimmed_read_counts.tsv 
+
+
+#get alignment counts before removal
+>getInitialAlignment
+for file in *sorted.bam
+do echo "samtools flagstat $file > ${file/_sorted.bam/}_prededup_flagstats.txt" >> getInitialAlignment
+done
+
+#get post removal alignment counts
+>getDupRemAlignment
+for file in *dupsRemoved.bam
+do echo "samtools flagstat $file > ${file/.bam/}_post_dedup_flagstats.txt &" >> getDupRemAlignment
+done
+
+
+
+#format properly paired reads
+>prededup_properly_paired_count.tsv
+for file in *prededup_flagstats.txt
+do pp=$(grep "properly paired" $file); echo -e "$file\t$pp" |\
+ awk '{split($1, a, "_prededup_flagstats.txt")
+ split($7, b, "(")
+ print a[1]"\t"$2"\tpredupPropPaired"}' >> prededup_properly_paired_count.tsv
+ done
+
+#format total reads
+>prededup_mapped_count.tsv
+for file in *prededup_flagstats.txt
+do pp=$(grep "mapped" $file | head -n 1)
+ echo -e "$file\t$pp" |\
+ awk '{split($1, a, "_prededup_flagstats.txt")
+ print a[1]"\t"$2"\tpredupMapped"}' >> prededup_mapped_count.tsv
+ done
+
+
+#removal metrics
+>dupRemovalMetrics.tsv
+for file in *dupMetrics.txt
+do pct=$(sed '8q;d' $file | cut -f 8)
+echo -e "$file\t$pct" |\
+ awk '{split($1, a, "_dupMetrics.txt")
+ print a[1]"\t"$2"\tdupRemProp"}' >> dupRemovalMetrics.tsv
+done
+
+
+#format properly paired reads
+>dedup_properly_paired_count.tsv
+for file in *_post_dedup_flagstats.txt
+do pp=$(grep "properly paired" $file)
+ echo -e "$file\t$pp" |\
+ awk '{split($1, a, "_dupsRemoved_post_dedup_flagstats.txt")
+ print a[1]"\t"$2"\tdedupPropPair"}' >> dedup_properly_paired_count.tsv
+done
+
+#format total reads
+>dedup_mapped_count.tsv
+for file in *_post_dedup_flagstats.txt
+do pp=$(grep "mapped" $file | head -n 1)
+ echo -e "$file\t$pp" |\
+ awk '{split($1, a, "_dupsRemoved_post_dedup_flagstats.txt")
+ print a[1]"\t"$2"\tdedupMapped"}' >> dedup_mapped_count.tsv
+ done
+
+
+#COUNTED ON GENES
+total_gene_counts_featureCounts.R all_featureCounts_geneCounts_laneDupsRemd.tsv
+
+
+
+#DATA PROCESSING RESULTS FILES SO FAR:
+raw_read_counts.tsv
+trimmed_read_counts.tsv
+prededup_properly_paired_count.tsv
+prededup_mapped_count.tsv
+prededup_mapping_eff.tsv
+dupRemovalMetrics.tsv
+dedup_properly_paired_count.tsv
+dedup_mapped_count.tsv
+dedup_mapping_eff.tsv
+
+
+#Assemble them all
+cat *.tsv > all_pipeline_counts.txt
+sed -i.bak 's/_dupsRemoved_NameSorted.bam//' all_pipeline_counts.txt
+sed -i.bak 's/geneCountedFCs/geneCounted/' all_pipeline_counts.txt
+sed -i.bak 's/_1//' all_pipeline_counts.txt
+sed -i.bak '/dedupEff/d' all_pipeline_counts.txt
+
+#plot the results from all of these with pipeline_read_counts_all.R and pipeline_read_counts_single_project.R
+
+
+
+
+
+

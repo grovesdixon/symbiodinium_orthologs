@@ -1,0 +1,22 @@
+#analysis_steps.txt
+#assumes you've already run the two processing pipelines
+#should have these files:
+
+Ortholog pipeline:
+run1.end — fast ortho output
+run1_long.tsv — fast ortho output in long format
+singleCopyOrthos.txt — output from paraPrune.py
+init_single_copy_orthoGroups.txt — output from paraPrune.py
+collapsed_contigs.tsv — output from paraPrune.py
+
+RNA-seq pipeline:
+
+spp1_counts.tsv — assembled results from multicov
+spp2_counts.tsv — assembled results from multicov
+etc.
+
+
+1. initialize_counts.R
+	Merge counts files with the ortholog tables
+	
+2.
